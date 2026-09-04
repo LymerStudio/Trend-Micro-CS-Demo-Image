@@ -1,0 +1,140 @@
+name: Security Simulation - Org Access Attempts
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Escenario (All, TokenAbuse, PrivilegeChange, RepoExposure, DefenseEvasion, Destruction)'
+        required: false
+        default: 'All'
+
+permissions:
+  contents: read
+
+jobs:
+  simulate-org-access:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar escenario
+        if: ${{ !(github.event.inputs.scenario == 'All' || contains('TokenAbuse PrivilegeChange RepoExposure DefenseEvasion Destruction', github.event.inputs.scenario)) }}
+        run: |
+          echo "::error::Escenario invalido: ${{ github.event.inputs.scenario }}"
+          exit 1
+
+      - name: Metadata de correlacion (SIEM)
+        id: meta
+        shell: bash
+        run: |
+          echo "actor=${{ github.actor }}" >> "$GITHUB_OUTPUT"
+          echo "org=${{ github.repository_owner }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          # run_id determinista corto, para cruzar con test_run_id en el SIEM
+          echo "run_id=$(echo "${GITHUB_RUN_ID}-${{ github.actor }}" | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+
+      - name: 'Sim TokenAbuse: listar installations de la org'
+        id: sim-token
+        if: ${{ github.event.inputs.scenario == 'All' || contains(github.event.inputs.scenario, 'TokenAbuse') }}
+        shell: bash
+        run: |
+          set +e
+          RESP=$(gh api "orgs/${{ steps.meta.outputs.org }}/installations" 2>&1)
+          RC=$?
+          set -e
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::Acceso a org RECHAZADO (esperado). rc=$RC"
+            echo "denied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ACCESO INESPERADO a installations de la org. Revisar."
+            echo "denied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 'Sim PrivilegeChange: anadir miembro admin a la org'
+        if: ${{ github.event.inputs.scenario == 'All' || contains(github.event.inputs.scenario, 'PrivilegeChange') }}
+        shell: bash
+        run: |
+          set +e
+          RESP=$(gh api -X PUT "orgs/${{ steps.meta.outputs.org }}/memberships/conta-externa-simulada" \
+            -f role=admin 2>&1)
+          RC=$?
+          set -e
+          echo "::warning::Cambio de privilegio RECHAZADO (esperado). rc=$RC"
+
+      - name: 'Sim RepoExposure: cambiar visibilidad del repo a public'
+        if: ${{ github.event.inputs.scenario == 'All' || contains(github.event.inputs.scenario, 'RepoExposure') }}
+        shell: bash
+        run: |
+          set +e
+          RESP=$(gh api -X PATCH "repos/${{ steps.meta.outputs.repo }}" -f visibility=public 2>&1)
+          RC=$?
+          set -e
+          echo "::warning::Exposicion del repo RECHAZADA (esperado). rc=$RC"
+
+      - name: 'Sim DefenseEvasion: borrar proteccion de rama main'
+        if: ${{ github.event.inputs.scenario == 'All' || contains(github.event.inputs.scenario, 'DefenseEvasion') }}
+        shell: bash
+        run: |
+          set +e
+          RESP=$(gh api -X DELETE "repos/${{ steps.meta.outputs.repo }}/branches/main/protection" 2>&1)
+          RC=$?
+          set -e
+          echo "::warning::Eliminacion de proteccion RECHAZADA (esperado). rc=$RC"
+
+      - name: 'Sim Destruction: borrar el repositorio'
+        if: ${{ github.event.inputs.scenario == 'All' || contains(github.event.inputs.scenario, 'Destruction') }}
+        shell: bash
+        run: |
+          set +e
+          RESP=$(gh api -X DELETE "repos/${{ steps.meta.outputs.repo }}" 2>&1)
+          RC=$?
+          set -e
+          echo "::warning::Borrado del repo RECHAZADO (esperado). rc=$RC"
+
+      - name: Resumen de simulacion (evento SIEM)
+        shell: bash
+        run: |
+          TS=$(date +%s%3N)
+          ORG="${{ steps.meta.outputs.org }}"
+          REPO="${{ steps.meta.outputs.repo }}"
+          ACTOR="${{ steps.meta.outputs.actor }}"
+          RUN_ID="${{ steps.meta.outputs.run_id }}"
+          DOC=$(echo "$ACTOR-$TS" | md5sum | cut -c1-32)
+          REQ="SIM-$(echo "$ORG-$REPO-$TS" | md5sum | cut -c1-16)"
+          TEST_RUN_ID="github-actions-$RUN_ID"
+          # JSON generado con jq (preinstalado en runners de GitHub) para
+          # evitar heredocs que rompan el bloque YAML. Formato compatible
+          # con attacks-oauth.ps1 / attacks-oauth.sh.
+          jq -cn \
+            --argjson ts "$TS" \
+            --arg doc "$DOC" \
+            --arg actor "$ACTOR" \
+            --arg org "$ORG" \
+            --arg repo "$REPO" \
+            --arg req "$REQ" \
+            --arg test_run_id "$TEST_RUN_ID" \
+            --arg scenario "${{ github.event.inputs.scenario }}" \
+            '{
+              "@timestamp": $ts,
+              created_at: $ts,
+              _document_id: $doc,
+              action: "simulation.completed",
+              actor: $actor,
+              actor_ip: "203.0.113.77",
+              org: $org,
+              repo: $repo,
+              repository: $repo,
+              operation_type: "create",
+              user_agent: "github-actions-safe-simulator/1.0",
+              request_id: $req,
+              siem_test: true,
+              test_run_id: $test_run_id,
+              test_scenario: $scenario,
+              test_severity: "info",
+              test_iteration: 1,
+              workflow: "Security Simulation - Org Access Attempts",
+              simulated_org_access: true
+            }'
+          echo "::notice::Simulacion terminada. Ver el audit log de la org para los intentos rechazados (HTTP 403/404)."
