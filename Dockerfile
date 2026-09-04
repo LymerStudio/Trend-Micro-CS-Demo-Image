@@ -15,4 +15,5 @@ COPY struts2-showcase-2.3.12.war /usr/local/tomcat/webapps/ROOT.war
 COPY key.pem /usr/local/tomcat/webapps/key.pem
 COPY ImportantFile.txt /usr/local/tomcat/webapps/ImportantFile.txt
 #Expose the Service
+#Test
 EXPOSE 8080
